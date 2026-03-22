@@ -1,0 +1,52 @@
+[project]
+name = "super-job-apply"
+version = "0.1.0"
+description = "AI-powered job application automation at scale with match scoring, resume tailoring, and application tracking"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "exa-py",
+    "stagehand",
+    "playwright",
+    "python-dotenv",
+    "pyyaml",
+    "pydantic>=2.0",
+    "aiosqlite",
+    "click",
+    "python-docx",
+    "anthropic",
+    "rich",
+    "httpx",
+]
+
+[project.scripts]
+super-job-apply = "super_job_apply.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

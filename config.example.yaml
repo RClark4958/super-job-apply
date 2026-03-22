@@ -1,0 +1,60 @@
+# super-job-apply configuration
+# Copy this to config.yaml and fill in your details:
+#   cp config.example.yaml config.yaml
+
+candidate:
+  name: "Your Name"
+  email: "your.email@gmail.com"
+  account_email: ""  # Optional: separate email for job site account creation (e.g. Yahoo with IMAP access)
+  phone: "+1-555-000-0000"
+  linkedin_url: "https://linkedin.com/in/yourprofile"
+  portfolio_url: ""  # Optional: GitHub, personal site, etc.
+  location: "City, State"
+  willing_to_relocate: true
+  requires_sponsorship: false
+  visa_status: ""
+  skills:
+    - Python
+    - Your Skill 1
+    - Your Skill 2
+  years_experience: 0
+  experience_summary: |
+    Brief summary of your professional background. 2-3 sentences
+    highlighting your key experience and what you're looking for.
+  education:
+    - degree: "Your Degree"
+      school: "Your University"
+      year: 2020
+  target_roles:
+    - "Software Engineer"
+    - "Your Target Role"
+  target_industries:
+    - "AI/ML"
+    - "Your Industry"
+
+search:
+  queries:
+    - "your target role remote jobs hiring"
+    - "your skills engineer remote positions"
+  locations:
+    - "Your City, State"
+    - "Remote"
+  num_results_per_query: 10
+  exclude_domains:
+    - "linkedin.com"
+  date_range_days: 30
+
+application:
+  min_match_score: 0.6
+  concurrent: false
+  max_concurrent_browsers: 1
+  use_proxy: false
+  dry_run: true  # Start with dry_run to review before submitting
+  max_retries: 1
+  resume_template_path: "./resume_template.docx"
+  output_dir: "./output"
+  model: "anthropic/claude-haiku-4-5-20251001"
+  agent_model: "anthropic/claude-haiku-4-5-20251001"
+  tailoring_model: "claude-sonnet-4-6"
+  db_path: "./applications.db"
+  account_password: ""  # Password for job site account creation (set a strong one)
