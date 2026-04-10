@@ -375,13 +375,14 @@ def submit(config_path: str) -> None:
         candidate = config.candidate
 
         from .applicator.browser import apply_with_retry
+        from .applicator.email_verifier import EmailWatcher
         from .audit import AuditTrail
 
         audit_trail = AuditTrail(
             db_path=settings.db_path, output_dir=settings.output_dir
         )
 
-        MAX_TOTAL_ATTEMPTS = 3  # Hard cap: never attempt a job more than 3 times total
+        MAX_TOTAL_ATTEMPTS = 3
 
         async def _submit_one(app: dict, index: int, total: int) -> dict:
             """Submit a single application and record the result."""
@@ -442,6 +443,7 @@ def submit(config_path: str) -> None:
                 resume_path=app.get("resume_path"),
                 cover_letter_text=cover_letter_text,
                 submit=True,
+                email_watcher=email_watcher,
             )
 
             success = result.get("success", False)
@@ -493,6 +495,14 @@ def submit(config_path: str) -> None:
         async def _submit():
             await audit_trail.init()
 
+            # Start email watcher for security code handling
+            email_watcher = EmailWatcher()
+            email_watcher.start()
+            console.print(
+                f"[dim]Email watcher: {'active' if email_watcher.available else 'disabled'}"
+                f" ({email_watcher.imap_email})[/dim]"
+            )
+
             apps = await db.get_applications(
                 status=ApplicationStatus("approved"), limit=500
             )
@@ -534,14 +544,21 @@ def submit(config_path: str) -> None:
                     result = await _submit_one(app, i + 1, len(apps))
                     results.append(result)
 
+            # Stop email watcher
+            email_watcher.stop()
+
             # Summary
             ok = sum(1 for r in results if r.get("success"))
             fail = len(results) - ok
+            confirmed = sum(1 for r in results if r.get("confirmed"))
+            fields = sum(r.get("fields_filled", 0) for r in results)
             console.print("\n" + "=" * 60)
             console.print(
                 f"[bold]Submission complete:[/bold] "
                 f"[green]{ok} submitted[/green], "
-                f"[red]{fail} failed[/red]"
+                f"[bold green]{confirmed} confirmed[/bold green], "
+                f"[red]{fail} failed[/red], "
+                f"{fields} total fields filled"
             )
 
         asyncio.run(_submit())

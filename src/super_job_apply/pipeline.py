@@ -67,9 +67,12 @@ async def run_pipeline(config: AppConfig) -> None:
 
     for source in sources:
         try:
-            jobs = await source.discover(config.search)
+            jobs = await asyncio.wait_for(source.discover(config.search), timeout=600.0)
             all_jobs.extend(jobs)
             console.print(f"  {source.source_name}: found {len(jobs)} jobs")
+        except asyncio.TimeoutError:
+            logger.warning(f"Source {source.source_name} timed out after 10 min")
+            console.print(f"  [yellow]{source.source_name}: timed out[/yellow]")
         except Exception as e:
             logger.warning(f"Source {source.source_name} failed: {e}")
             console.print(f"  [yellow]{source.source_name}: failed ({e})[/yellow]")
@@ -98,8 +101,14 @@ async def run_pipeline(config: AppConfig) -> None:
                 responsibilities=job.responsibilities,
             )
 
+    # Filter to whitelisted domains only
+    from .discovery.domain_whitelist import is_whitelisted
+    before_filter = len(new_jobs)
+    new_jobs = [j for j in new_jobs if is_whitelisted(j.careers_url)]
+
     console.print(
-        f"  {len(all_jobs)} discovered, {len(all_jobs) - len(new_jobs)} duplicates removed, "
+        f"  {len(all_jobs)} discovered, {len(all_jobs) - before_filter} duplicates removed, "
+        f"{before_filter - len(new_jobs)} junk domains filtered, "
         f"{len(new_jobs)} new jobs"
     )
 
@@ -114,28 +123,26 @@ async def run_pipeline(config: AppConfig) -> None:
     if aggregator_jobs:
         console.print(f"\n[bold blue]Step 2b: Resolving {len(aggregator_jobs)} aggregator URLs...[/bold blue]")
         resolved_count = 0
-        for job in aggregator_jobs:
-            direct_url = await resolve_to_direct_url(
-                job.company_name, job.job_title, job.careers_url
-            )
+        skipped_agg = 0
+        for job in list(aggregator_jobs):  # iterate a copy
+            try:
+                direct_url = await asyncio.wait_for(
+                    resolve_to_direct_url(job.company_name, job.job_title, job.careers_url),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                direct_url = None
             if direct_url and not is_aggregator(direct_url):
-                old_url = job.careers_url
                 job.careers_url = direct_url
-                # Update in DB too
                 async with __import__("aiosqlite").connect(settings.db_path) as _db:
-                    await _db.execute(
-                        "UPDATE jobs SET careers_url = ? WHERE id = ?",
-                        (direct_url, job.id)
-                    )
+                    await _db.execute("UPDATE jobs SET careers_url = ? WHERE id = ?", (direct_url, job.id))
                     await _db.commit()
                 resolved_count += 1
-                console.print(f"  [green]Resolved:[/green] {job.company_name} → {direct_url[:60]}")
             else:
-                # Remove from new_jobs — can't apply to unresolved aggregator
                 new_jobs.remove(job)
-                console.print(f"  [dim]Skipped (unresolvable): {job.company_name}[/dim]")
-            await asyncio.sleep(2)  # Rate limit Exa
-        console.print(f"  {resolved_count} resolved, {len(aggregator_jobs) - resolved_count} removed")
+                skipped_agg += 1
+            await asyncio.sleep(1)
+        console.print(f"  {resolved_count} resolved, {skipped_agg} removed")
 
     # --- Step 3: Score ---
     console.print("\n[bold blue]Step 3: Scoring job-candidate fit...[/bold blue]")
