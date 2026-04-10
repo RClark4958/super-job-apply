@@ -64,7 +64,7 @@ async def apply_to_job(
     )
 
     # Enable proxy + stealth to avoid reCAPTCHA detection on Greenhouse etc.
-    session_params = {}
+    session_params = {"wait_for_captcha_solves": True}
     if settings.use_proxy:
         session_params["browserbase_session_create_params"] = {
             "proxies": True,
@@ -396,6 +396,18 @@ async def apply_to_job(
                 post_type = post.get("page_type", "")
                 logger.info(f"{prefix}   Retry {retry+1} post-submit: type={post_type}, code={asks_code}, conf='{confirmation[:60]}'")
 
+            # Handle reCAPTCHA — wait for Browserbase auto-solve then resubmit
+            if confirmation and "recaptcha" in (confirmation + post_type).lower():
+                logger.info(f"{prefix}   reCAPTCHA detected — waiting for auto-solve (30s)...")
+                await asyncio.sleep(30)
+                await act("Click the Submit, Submit Application, or Resubmit button")
+                await asyncio.sleep(6)
+                post = await extract("Is this now a confirmation page, security code page, or still reCAPTCHA?")
+                asks_code = post.get("asks_for_security_code", False)
+                confirmation = post.get("confirmation_message", "")
+                post_type = post.get("page_type", "")
+                logger.info(f"{prefix}   After reCAPTCHA wait: type={post_type}, code={asks_code}, conf='{confirmation[:60]}'")
+
             if asks_code and email_watcher and email_watcher.available:
                 logger.info(f"{prefix} STEP 11: Security code required — checking email...")
                 code = await email_watcher.wait_for_code(company_hint=job.company_name, timeout=120)
@@ -414,9 +426,14 @@ async def apply_to_job(
                 else:
                     logger.warning(f"{prefix}   No security code received from email")
 
+            # Filter out false positives — reCAPTCHA is NOT a confirmation
+            if confirmation and any(kw in confirmation.lower() for kw in ["recaptcha", "captcha", "resubmit"]):
+                logger.warning(f"{prefix}   reCAPTCHA challenge detected: {confirmation[:80]}")
+                confirmation = ""  # Not a real confirmation
+
             if confirmation:
                 logger.info(f"{prefix} ✓ CONFIRMED: {confirmation[:80]}")
-            elif post_type == "confirmation":
+            elif post_type and "confirmation" in post_type.lower():
                 logger.info(f"{prefix} ✓ CONFIRMED (page type)")
                 confirmation = "Confirmation page detected"
 
