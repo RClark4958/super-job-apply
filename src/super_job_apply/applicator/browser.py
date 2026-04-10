@@ -162,8 +162,25 @@ async def apply_to_job(
             logger.warning(f"{prefix} NO FORM FOUND: {page_type} — {desc}")
             return {"success": False, "message": f"No form: {page_type}. {desc}", "session_url": session_url, "account_created": False}
 
-        # === STEP 5: Fill form fields individually ===
-        logger.info(f"{prefix} STEP 5: Filling form fields...")
+        # === STEP 5: Observe ALL form fields ===
+        logger.info(f"{prefix} STEP 5: Discovering all form fields with observe()...")
+        try:
+            obs_resp = await client.sessions.observe(
+                id=sid,
+                instruction="Find ALL input fields, text areas, dropdowns, checkboxes, radio buttons, and file upload fields in the application form",
+            )
+            observed = obs_resp.data if isinstance(obs_resp.data, list) else (obs_resp.data.result if hasattr(obs_resp.data, 'result') else [])
+            field_names = []
+            for f in (observed or []):
+                desc = f.description if hasattr(f, 'description') else (f.get('description', '') if isinstance(f, dict) else str(f))
+                field_names.append(desc)
+            logger.info(f"{prefix}   Found {len(field_names)} form fields")
+        except Exception as e:
+            logger.warning(f"{prefix}   observe() failed: {e} — falling back to manual fill")
+            field_names = []
+
+        # === STEP 6: Fill every field using smart mapping ===
+        logger.info(f"{prefix} STEP 6: Filling all fields...")
 
         name_parts = candidate.name.split()
         first = name_parts[0] if name_parts else candidate.name
@@ -171,59 +188,136 @@ async def apply_to_job(
         sponsor = "No" if not candidate.requires_sponsorship else "Yes"
         relocate = "Yes" if candidate.willing_to_relocate else "No"
         cl = (cover_letter_text or "I am excited about this opportunity.")[:500]
+        exp = (candidate.experience_summary or "")[:400]
         portfolio = candidate.portfolio_url or ""
 
-        # Core text fields — includes common Greenhouse/Lever custom fields
+        # Map field descriptions to values
+        field_map = {
+            "first name": first,
+            "last name": last,
+            "preferred": first,
+            "email": acct_email,
+            "phone": candidate.phone,
+            "linkedin": candidate.linkedin_url,
+            "location": candidate.location,
+            "address": candidate.location,
+            "city": candidate.location,
+            "website": portfolio,
+            "github": portfolio,
+            "portfolio": portfolio,
+            "personal preference": first,  # Name/pronoun preferences
+        }
+
+        # Dropdown/select mappings
+        select_map = {
+            "country dropdown": "United States",
+            "visa sponsorship": sponsor,
+            "require visa": sponsor,
+            "require employment visa": sponsor,
+            "open to relocation": relocate,
+            "in-person": relocate,
+            "hybrid": relocate,
+            "interviewed at": "No",
+            "applied before": "No",
+            "hear about": "Job Board",
+            "source": "Other",
+            "authorized to work": "Yes",
+            "ai policy": "I agree",
+            "expertise coding in python": "Yes",
+            "makes use of large language models": "Yes",
+            "gender dropdown": "Decline to self-identify",
+            "hispanic": "Decline to self-identify",
+            "veteran status": "I am not a protected veteran",
+            "disability status": "I do not wish to answer",
+            "race": "Decline to self-identify",
+            "ethnicity": "Decline to self-identify",
+        }
+
+        # Text area mappings (checked BEFORE select to prevent text areas being matched as selects)
+        text_map = {
+            "cover letter": cl,
+            "why anthropic": cl,
+            "why interested": cl,
+            "why " + job.company_name.lower(): cl,
+            "most complex and interesting": exp or "I built an enterprise RAG system with Vector Search across 14000+ pages of documentation, and an autonomous coding agent integrating Aider with Claude Opus that executes code in Databricks and creates PRs.",
+            "describe the most complex": exp or "I built an enterprise RAG system with Vector Search across 14000+ pages of documentation, and an autonomous coding agent integrating Aider with Claude Opus that executes code in Databricks and creates PRs.",
+            "examples of your work with llm": portfolio or "https://github.com/RClark4958",
+            "examples of your work": portfolio or "https://github.com/RClark4958",
+            "additional information": "Thank you for your consideration.",
+            "deadline": "No specific deadlines",
+            "timeline consideration": "No specific deadlines",
+            "earliest you would want to start": "As soon as possible",
+            "start working": "As soon as possible",
+            "plan on working": candidate.location,
+            "address from which": candidate.location,
+            "publication": "",
+        }
+
         fields_filled = 0
-        core_fields = [
-            (f"Type '{first}' into the 'First Name' or 'First name' field", "first name"),
-            (f"Type '{last}' into the 'Last Name' or 'Last name' field", "last name"),
-            (f"Type '{first}' into any 'Preferred First Name' or 'Preferred Name' field", "preferred name"),
-            (f"Type '{acct_email}' into the 'Email' or 'Email address' field", "email"),
-            (f"Type '{candidate.phone}' into the 'Phone' or 'Phone number' field", "phone"),
-            (f"Type '{candidate.linkedin_url}' into any 'LinkedIn' or 'LinkedIn Profile' field", "linkedin"),
-            (f"Type '{candidate.location}' into any 'Location', 'City', 'Address', or 'Current Location' field", "location"),
-        ]
-        if portfolio:
-            core_fields.append((f"Type '{portfolio}' into any 'Website', 'GitHub URL', 'Portfolio', or 'Personal Website' field", "portfolio"))
 
-        for instruction, label in core_fields:
-            result = await act(instruction)
-            if "successfully" in result.lower():
+        for desc in field_names:
+            dl = desc.lower()
+
+            # Skip file uploads
+            if any(kw in dl for kw in ["file upload", "resume", "attach", "cv upload"]):
+                continue
+
+            # Try text area mapping FIRST (long-form fields like "describe the most complex...")
+            matched = False
+            for key, value in text_map.items():
+                if key in dl:
+                    if value:
+                        clean_desc = desc.split(' text ')[0].split(' area')[0]
+                        await act(f"Type '{value[:400]}' into the '{clean_desc}' field")
+                        fields_filled += 1
+                    matched = True
+                    break
+
+            if matched:
+                await asyncio.sleep(0.3)
+                continue
+
+            # Try text field mapping (short fields: name, email, phone)
+            for key, value in field_map.items():
+                if key in dl and value:
+                    clean_desc = desc.split(' text ')[0].split(' input')[0]
+                    await act(f"Type '{value}' into the '{clean_desc}' field")
+                    fields_filled += 1
+                    matched = True
+                    break
+
+            if matched:
+                await asyncio.sleep(0.3)
+                continue
+
+            # Try dropdown mapping
+            for key, value in select_map.items():
+                if key in dl:
+                    clean_desc = desc.split(' dropdown')[0].split(' combobox')[0]
+                    await act(f"Select '{value}' for the '{clean_desc}' field")
+                    fields_filled += 1
+                    matched = True
+                    break
+
+            if matched:
+                await asyncio.sleep(0.3)
+                continue
+
+            # Checkbox — check it
+            if "checkbox" in dl or "certif" in dl or "consent" in dl or "agree" in dl or "accept" in dl:
+                await act(f"Check the '{desc}' checkbox")
                 fields_filled += 1
-            await asyncio.sleep(0.3)
+                await asyncio.sleep(0.3)
+                continue
 
-        logger.info(f"{prefix}   Core fields filled: {fields_filled}/{len(core_fields)}")
+        logger.info(f"{prefix}   Filled {fields_filled}/{len(field_names)} fields")
 
-        # === STEP 6: Dropdowns and selections ===
-        logger.info(f"{prefix} STEP 6: Dropdowns and selections")
-        selections = [
-            "Select 'United States' from any 'Country' dropdown",
-            f"For any visa or sponsorship question, select '{sponsor}'",
-            f"For any relocation question, select '{relocate}'",
-            "For any 'interviewed here before' or 'applied before' question, select 'No'",
-            "For any 'how did you hear' or 'source' dropdown, select 'Job Board' or 'Other'",
-            "For any 'authorized to work' question, select 'Yes'",
-            f"For any 'willing to work in-person' or 'hybrid' question, select '{relocate}'",
-            "For any EEO gender question, select 'Decline to self-identify'",
-            "For any veteran status question, select 'I am not a protected veteran'",
-            "For any disability question, select 'I do not wish to answer'",
-            "For any race/ethnicity question, select 'Decline to self-identify'",
-            "Check ALL required checkboxes including certifications, privacy policies, consent, and terms",
-        ]
-        for s in selections:
-            await act(s)
-            await asyncio.sleep(0.3)
+        # === STEP 7: Check all consent/policy checkboxes ===
+        logger.info(f"{prefix} STEP 7: Ensuring all checkboxes checked")
+        await act("Check ALL unchecked checkboxes on this page, especially certifications, privacy policies, consent forms, and terms of service")
+        await asyncio.sleep(0.5)
 
-        # === STEP 7: Text areas (cover letter, experience) ===
-        logger.info(f"{prefix} STEP 7: Text areas")
-        await act(f"Type into any 'Cover letter', 'Why interested', or 'Why {job.company_name}' text area: {cl}")
-        await asyncio.sleep(0.3)
-        if candidate.experience_summary:
-            await act(f"If there's a field about experience or projects, type: {candidate.experience_summary[:400]}")
-            await asyncio.sleep(0.3)
-
-        # === STEP 8: Upload resume BEFORE validation check ===
+        # === STEP 8: Upload resume ===
         if resume_path:
             logger.info(f"{prefix} STEP 8: Uploading resume")
             try:
@@ -233,33 +327,18 @@ async def apply_to_job(
             except Exception as e:
                 logger.warning(f"{prefix}   Resume upload failed: {e}")
 
-        # === STEP 9: Sweep remaining required fields ===
-        logger.info(f"{prefix} STEP 9: Checking remaining required fields")
+        # === STEP 9: Final sweep — fill anything still empty ===
+        logger.info(f"{prefix} STEP 9: Final sweep of empty required fields")
         remaining = await extract("List any REQUIRED fields that are still EMPTY. Exclude file upload / resume fields.")
         empty = remaining.get("empty_required_fields", [])
 
         if empty:
-            logger.info(f"{prefix}   {len(empty)} empty required: {empty[:5]}")
-            for field in empty[:12]:
+            logger.info(f"{prefix}   {len(empty)} still empty: {[e[:40] for e in empty[:5]]}")
+            for field in empty[:10]:
                 fl = field.lower()
                 if any(skip in fl for skip in ["resume", "cv", "file", "upload"]):
                     continue
-                elif any(kw in fl for kw in ["sponsor", "visa"]):
-                    await act(f"Select '{sponsor}' for '{field}'")
-                elif "reloca" in fl:
-                    await act(f"Select '{relocate}' for '{field}'")
-                elif any(kw in fl for kw in ["gender", "veteran", "disability", "race", "hispanic", "ethnicity"]):
-                    await act(f"Select 'Decline to self-identify' or 'Prefer not to say' for '{field}'")
-                elif any(kw in fl for kw in ["policy", "agree", "acknowledge", "consent", "certify", "understand"]):
-                    await act(f"Check the '{field}' checkbox")
-                elif any(kw in fl for kw in ["interview", "before"]):
-                    await act(f"Select 'No' for '{field}'")
-                elif any(kw in fl for kw in ["start", "earliest", "available"]):
-                    await act(f"Type 'As soon as possible' into '{field}'")
-                elif any(kw in fl for kw in ["salary", "compensation", "pay"]):
-                    await act(f"Type 'Open to discussion' into '{field}'")
-                else:
-                    await act(f"Fill '{field}' with an appropriate answer for a {candidate.years_experience}-year engineer")
+                await act(f"Fill or select an appropriate value for: '{field}'")
                 await asyncio.sleep(0.3)
         else:
             logger.info(f"{prefix}   All required fields filled")
