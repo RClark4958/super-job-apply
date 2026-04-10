@@ -63,7 +63,14 @@ async def apply_to_job(
         model_api_key=get_model_api_key(),
     )
 
-    start_response = await client.sessions.start(model_name=settings.model)
+    # Enable proxy + stealth to avoid reCAPTCHA detection on Greenhouse etc.
+    session_params = {}
+    if settings.use_proxy:
+        session_params["browserbase_session_create_params"] = {
+            "proxies": True,
+        }
+
+    start_response = await client.sessions.start(model_name=settings.model, **session_params)
     sid = start_response.data.session_id
     session_url = f"https://browserbase.com/sessions/{sid}"
     logger.info(f"{prefix} Session: {session_url}")
@@ -166,18 +173,19 @@ async def apply_to_job(
         cl = (cover_letter_text or "I am excited about this opportunity.")[:500]
         portfolio = candidate.portfolio_url or ""
 
-        # Core text fields
+        # Core text fields — includes common Greenhouse/Lever custom fields
         fields_filled = 0
         core_fields = [
-            (f"Type '{first}' into the 'First Name' field", "first name"),
-            (f"Type '{last}' into the 'Last Name' field", "last name"),
-            (f"Type '{acct_email}' into the 'Email' field", "email"),
-            (f"Type '{candidate.phone}' into the 'Phone' field", "phone"),
-            (f"Type '{candidate.linkedin_url}' into any 'LinkedIn' field", "linkedin"),
-            (f"Type '{candidate.location}' into any 'Location' or 'Address' field", "location"),
+            (f"Type '{first}' into the 'First Name' or 'First name' field", "first name"),
+            (f"Type '{last}' into the 'Last Name' or 'Last name' field", "last name"),
+            (f"Type '{first}' into any 'Preferred First Name' or 'Preferred Name' field", "preferred name"),
+            (f"Type '{acct_email}' into the 'Email' or 'Email address' field", "email"),
+            (f"Type '{candidate.phone}' into the 'Phone' or 'Phone number' field", "phone"),
+            (f"Type '{candidate.linkedin_url}' into any 'LinkedIn' or 'LinkedIn Profile' field", "linkedin"),
+            (f"Type '{candidate.location}' into any 'Location', 'City', 'Address', or 'Current Location' field", "location"),
         ]
         if portfolio:
-            core_fields.append((f"Type '{portfolio}' into any 'Website' or 'GitHub' field", "portfolio"))
+            core_fields.append((f"Type '{portfolio}' into any 'Website', 'GitHub URL', 'Portfolio', or 'Personal Website' field", "portfolio"))
 
         for instruction, label in core_fields:
             result = await act(instruction)
@@ -190,12 +198,18 @@ async def apply_to_job(
         # === STEP 6: Dropdowns and selections ===
         logger.info(f"{prefix} STEP 6: Dropdowns and selections")
         selections = [
-            "Select 'United States' from any Country dropdown",
-            f"For any visa/sponsorship question, select '{sponsor}'",
+            "Select 'United States' from any 'Country' dropdown",
+            f"For any visa or sponsorship question, select '{sponsor}'",
             f"For any relocation question, select '{relocate}'",
-            "For any 'interviewed here before' question, select 'No'",
-            "For any 'how did you hear' question, select 'Job Board' or 'Other'",
-            "Check any required policy/agreement checkboxes",
+            "For any 'interviewed here before' or 'applied before' question, select 'No'",
+            "For any 'how did you hear' or 'source' dropdown, select 'Job Board' or 'Other'",
+            "For any 'authorized to work' question, select 'Yes'",
+            f"For any 'willing to work in-person' or 'hybrid' question, select '{relocate}'",
+            "For any EEO gender question, select 'Decline to self-identify'",
+            "For any veteran status question, select 'I am not a protected veteran'",
+            "For any disability question, select 'I do not wish to answer'",
+            "For any race/ethnicity question, select 'Decline to self-identify'",
+            "Check ALL required checkboxes including certifications, privacy policies, consent, and terms",
         ]
         for s in selections:
             await act(s)
@@ -254,13 +268,15 @@ async def apply_to_job(
         if submit:
             logger.info(f"{prefix} STEP 10: Clicking submit")
             await act("Click the Submit, Submit Application, Apply, or Send Application button")
-            await asyncio.sleep(4)
+            await asyncio.sleep(6)  # Give Greenhouse time to process + redirect
 
             # === STEP 11: Handle security code page ===
             post = await extract(
-                "After clicking submit: Is this a confirmation/thank you page? "
-                "Or does it ask to enter a security code or verification code? "
-                "Or is there a form validation error?"
+                "What is showing on this page RIGHT NOW? Options: "
+                "1) A 'thank you' or 'application received' confirmation page, "
+                "2) A page asking to 'enter your security code' with an input field for a code, "
+                "3) The same application form with red error messages or 'required' warnings, "
+                "4) Something else (describe it)"
             )
             asks_code = post.get("asks_for_security_code", False)
             confirmation = post.get("confirmation_message", "")
