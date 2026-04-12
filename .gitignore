@@ -23,10 +23,12 @@ env/
 config.yaml
 private/
 resume_template.docx
+.claude/
 
 # Output artifacts (contain PII in tailored resumes, cover letters, audit trails)
 output/
 *.db
+*.db.bak*
 
 # Log files (contain PII references)
 *.log

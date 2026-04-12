@@ -34,7 +34,8 @@ COMPANY_DOMAINS = {
     "anyscale.com", "modal.com", "langchain.com",
     "pinecone.io", "weaviate.io", "cohere.com",
     "huggingface.co", "wandb.ai", "deepmind.com",
-    "scale.com", "cursor.com",
+    "scale.com", "cursor.com", "mistral.ai",
+    "replicate.com",
 
     # Data/DevOps/Cloud
     "datadoghq.com", "grafana.com", "elastic.co",
@@ -43,6 +44,13 @@ COMPANY_DOMAINS = {
     "prefect.io", "dagster.io", "airbyte.com",
     "neon.tech", "timescale.com", "clickhouse.com",
     "mongodb.com", "redis.com", "fly.io", "railway.app",
+    "temporal.io", "pulumi.com",
+
+    # Developer tools / SaaS
+    "retool.com", "linear.app", "posthog.com",
+    "about.gitlab.com", "gitlab.com",
+    "snyk.io", "launchdarkly.com", "sentry.io",
+    "sourcegraph.com", "tailscale.com",
 
     # Enterprise/Healthcare/Finance
     "unitedhealthgroup.com", "molinahealthcare.com",
@@ -62,6 +70,13 @@ COMPANY_DOMAINS = {
     "talantix.io", "crossover.com",
     "toptal.com", "turing.com",
     "n-ix.com", "teksystems.com",
+
+    # Job boards / aggregators with working apply forms
+    "getonbrd.com", "jaabz.com",
+    "remoterocketship.com", "dailyremote.com",
+
+    # Additional company career sites
+    "cognizant.com",
 
     # Other known companies
     "airbnb.com", "uber.com", "lyft.com",

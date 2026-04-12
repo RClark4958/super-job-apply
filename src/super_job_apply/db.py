@@ -233,6 +233,60 @@ class Database:
             )
             return await cursor.fetchone() is not None
 
+    async def get_submittable_jobs(
+        self,
+        blocked_platforms: set[str] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return jobs that are NOT on blocked ATS platforms and have a submittable status.
+
+        Uses ats_detection.detect_ats_platform to classify each URL, then
+        filters out those on blocked platforms (default: greenhouse, lever).
+
+        Args:
+            blocked_platforms: Set of blocked ATS names. Defaults to BLOCKED_ATS.
+            statuses: Application statuses to include. Defaults to approved/pending.
+            limit: Max rows to return.
+
+        Returns:
+            List of dicts with job + application data and an ``ats_platform`` key.
+        """
+        from .ats_detection import BLOCKED_ATS, detect_ats_platform
+
+        if blocked_platforms is None:
+            blocked_platforms = BLOCKED_ATS
+        if statuses is None:
+            statuses = ["approved", "pending"]
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            placeholders = ",".join("?" for _ in statuses)
+            query = f"""
+                SELECT j.id as job_id, j.company_name, j.job_title, j.careers_url,
+                       j.location, j.work_type,
+                       a.id as app_id, a.status, a.match_score
+                FROM jobs j
+                LEFT JOIN applications a ON a.job_id = j.id
+                WHERE a.status IN ({placeholders})
+                ORDER BY a.match_score DESC NULLS LAST
+                LIMIT ?
+            """
+            cursor = await db.execute(query, [*statuses, limit])
+            rows = await cursor.fetchall()
+
+        results = []
+        for row in rows:
+            ats = detect_ats_platform(row["careers_url"] or "")
+            if ats in blocked_platforms:
+                continue
+            entry = dict(row)
+            entry["ats_platform"] = ats
+            results.append(entry)
+
+        return results
+
 
 def _row_to_job(row) -> JobPosting:
     """Convert a database row to a JobPosting model."""

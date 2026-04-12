@@ -150,6 +150,118 @@ def export(config_path: str, fmt: str, output: str | None) -> None:
 
 
 @main.command()
+@click.option("--config", "config_path", default="config.yaml", help="Path to config YAML")
+@click.option("--all-statuses", is_flag=True, help="Show all jobs, not just approved/pending/scored")
+def submittable(config_path: str, all_statuses: bool) -> None:
+    """List jobs that can be submitted (non-blocked ATS platforms).
+
+    Shows jobs from the database that are NOT on blocked ATS platforms
+    (Greenhouse, Lever) and have a submittable status.
+    """
+    try:
+        config = load_config(config_path)
+        db = Database(config.application.db_path)
+
+        from .ats_detection import BLOCKED_ATS, detect_ats_platform, get_form_hints
+
+        async def _list():
+            await db.init()
+            import aiosqlite
+
+            async with aiosqlite.connect(config.application.db_path) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                # Get all jobs joined with their latest application status
+                query = """
+                    SELECT j.id, j.company_name, j.job_title, j.careers_url,
+                           j.location, j.work_type,
+                           a.status, a.match_score, a.id as app_id
+                    FROM jobs j
+                    LEFT JOIN applications a ON a.job_id = j.id
+                    ORDER BY a.match_score DESC NULLS LAST
+                """
+                cursor = await conn.execute(query)
+                rows = await cursor.fetchall()
+
+            submittable_jobs = []
+            blocked_jobs = []
+            platform_counts: dict[str, int] = {}
+
+            for row in rows:
+                url = row["careers_url"] or ""
+                ats = detect_ats_platform(url)
+                platform_counts[ats or "unknown"] = platform_counts.get(ats or "unknown", 0) + 1
+
+                status = row["status"] or "no_application"
+                if not all_statuses and status not in ("approved", "pending", "scored", "no_application"):
+                    continue
+
+                entry = {
+                    "id": row["id"],
+                    "company": row["company_name"],
+                    "title": row["job_title"],
+                    "url": url,
+                    "ats": ats or "unknown",
+                    "status": status,
+                    "score": row["match_score"],
+                    "app_id": row["app_id"],
+                }
+
+                if ats in BLOCKED_ATS:
+                    blocked_jobs.append(entry)
+                else:
+                    submittable_jobs.append(entry)
+
+            # Platform breakdown
+            console.print("\n[bold]ATS Platform Breakdown (all jobs in DB):[/bold]")
+            for platform, count in sorted(platform_counts.items(), key=lambda x: -x[1]):
+                blocked_marker = " [red](BLOCKED)[/red]" if platform in BLOCKED_ATS else ""
+                console.print(f"  {platform}: {count}{blocked_marker}")
+
+            # Submittable jobs
+            console.print(f"\n[bold green]Submittable Jobs ({len(submittable_jobs)}):[/bold green]")
+            if submittable_jobs:
+                for i, job in enumerate(submittable_jobs, 1):
+                    score_str = f"{job['score']:.2f}" if job["score"] else "N/A"
+                    console.print(
+                        f"  {i:3}. [{job['ats']:16}] {job['company']:25} — {job['title'][:45]}"
+                    )
+                    console.print(
+                        f"       Score: {score_str} | Status: {job['status']} | {job['url'][:70]}"
+                    )
+            else:
+                console.print("  [yellow]No submittable jobs found.[/yellow]")
+
+            # Blocked summary
+            if blocked_jobs:
+                console.print(
+                    f"\n[dim]Blocked jobs ({len(blocked_jobs)}): "
+                    f"on {', '.join(sorted(BLOCKED_ATS))} — skipped automatically[/dim]"
+                )
+
+            # Actionable summary
+            ready = [j for j in submittable_jobs if j["status"] in ("approved",)]
+            pending_review = [j for j in submittable_jobs if j["status"] in ("pending",)]
+            no_app = [j for j in submittable_jobs if j["status"] == "no_application"]
+
+            console.print(f"\n[bold]Summary:[/bold]")
+            console.print(f"  Ready to submit (approved): {len(ready)}")
+            console.print(f"  Needs review (pending):     {len(pending_review)}")
+            console.print(f"  No application yet:         {len(no_app)}")
+            console.print(f"  Blocked (captcha):          {len(blocked_jobs)}")
+
+            if ready:
+                console.print("\nRun [bold]super-job-apply submit[/bold] to submit approved jobs.")
+            elif pending_review:
+                console.print("\nRun [bold]super-job-apply review[/bold] to approve pending jobs.")
+
+        asyncio.run(_list())
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@main.command()
 @click.argument("job_id")
 @click.option("--config", "config_path", default="config.yaml", help="Path to config YAML")
 def audit(job_id: str, config_path: str) -> None:
@@ -384,7 +496,7 @@ def submit(config_path: str) -> None:
 
         MAX_TOTAL_ATTEMPTS = 3
 
-        async def _submit_one(app: dict, index: int, total: int) -> dict:
+        async def _submit_one(app: dict, index: int, total: int, email_watcher=None) -> dict:
             """Submit a single application and record the result."""
             import json
             from datetime import datetime, timezone
@@ -512,6 +624,39 @@ def submit(config_path: str) -> None:
                 console.print("Run 'super-job-apply review' first to approve applications.")
                 return
 
+            # Filter out blocked ATS platforms before launching browsers
+            from .ats_detection import BLOCKED_ATS, detect_ats_platform
+            original_count = len(apps)
+            blocked_apps = []
+            submittable_apps = []
+            for app in apps:
+                ats = detect_ats_platform(app.get("careers_url", ""))
+                if ats in BLOCKED_ATS:
+                    blocked_apps.append((app, ats))
+                else:
+                    submittable_apps.append(app)
+
+            if blocked_apps:
+                console.print(
+                    f"[yellow]Skipping {len(blocked_apps)} jobs on blocked ATS "
+                    f"({', '.join(sorted(BLOCKED_ATS))}):[/yellow]"
+                )
+                for app, ats in blocked_apps:
+                    console.print(
+                        f"  [dim]{app.get('company_name', '?')} — {app.get('job_title', '?')} ({ats})[/dim]"
+                    )
+                    await db.update_application(
+                        app["id"],
+                        status=ApplicationStatus.SKIPPED,
+                        error_message=f"Blocked ATS: {ats}",
+                    )
+
+            apps = submittable_apps
+            if not apps:
+                console.print("[yellow]All approved applications are on blocked ATS platforms.[/yellow]")
+                console.print("Run 'super-job-apply submittable' to see available platforms.")
+                return
+
             max_browsers = settings.max_concurrent_browsers
             mode = f"concurrent, {max_browsers} browsers" if settings.concurrent else "sequential"
             console.print(
@@ -530,18 +675,18 @@ def submit(config_path: str) -> None:
                     )
                     chunk_results = await asyncio.gather(
                         *[
-                            _submit_one(app, i + j + 1, len(apps))
+                            _submit_one(app, i + j + 1, len(apps), email_watcher=email_watcher)
                             for j, app in enumerate(chunk)
                         ]
                     )
                     results.extend(chunk_results)
-                    # Brief pause between batches to avoid Gemini rate limits
+                    # Brief pause between batches to avoid API rate limits
                     if i + max_browsers < len(apps):
                         console.print("[dim]  Pausing 30s between batches (rate limit)...[/dim]")
                         await asyncio.sleep(30)
             else:
                 for i, app in enumerate(apps):
-                    result = await _submit_one(app, i + 1, len(apps))
+                    result = await _submit_one(app, i + 1, len(apps), email_watcher=email_watcher)
                     results.append(result)
 
             # Stop email watcher

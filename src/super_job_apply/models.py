@@ -73,6 +73,10 @@ class AppConfig(BaseModel):
     candidate: CandidateProfile
     search: SearchCriteria
     application: ApplicationSettings = Field(default_factory=ApplicationSettings)
+    career_page_urls: dict[str, str] = Field(
+        default_factory=dict,
+        description="Extra company career page URLs: {company_name: url}",
+    )
 
 
 # --- Pipeline Data Models ---

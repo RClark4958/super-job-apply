@@ -15,9 +15,10 @@ from rich.console import Console
 
 from .analysis.scorer import score_job
 from .applicator.browser import apply_with_retry
+from .ats_detection import BLOCKED_ATS, detect_ats_platform, is_blocked_ats
 from .audit import AuditTrail
 from .db import Database
-from .discovery.exa_company import ExaCompanySource
+from .discovery.career_pages import CareerPageSource
 from .discovery.exa_jobs import ExaJobSource
 from .discovery.greenhouse_lever import GreenhouseLeverSource
 from .discovery.linkedin_brightdata import LinkedInBrightDataSource
@@ -57,11 +58,16 @@ async def run_pipeline(config: AppConfig) -> None:
 
     # --- Step 1: Discover ---
     console.print("\n[bold blue]Step 1: Discovering jobs...[/bold blue]")
+
+    # Build career page source — merge any user-configured URLs from config.yaml.
+    career_page_overrides = config.career_page_urls or None
+
     sources = [
-        GreenhouseLeverSource(),   # Direct ATS boards — best quality, no aggregator noise
-        # LinkedInBrightDataSource(),  # Disabled: Bright Data polling takes 5+ min per query
-        ExaCompanySource(),         # Exa company search — finds careers pages
-        ExaJobSource(),             # Exa direct job search — broad coverage
+        LinkedInBrightDataSource(),  # LinkedIn via Bright Data — highest-quality external apply links
+        ExaJobSource(),             # Exa direct job search — broad coverage, real job postings
+        CareerPageSource(career_page_overrides),  # Direct career pages via Exa
+        GreenhouseLeverSource(),   # ATS boards — good for discovery, blocked at submission
+        # ExaCompanySource() — disabled: consistently times out (10 min) with zero results
     ]
     all_jobs = []
 
@@ -186,6 +192,35 @@ async def run_pipeline(config: AppConfig) -> None:
 
     if not qualifying:
         console.print("[yellow]No jobs met the minimum match score.[/yellow]")
+        return
+
+    # --- Step 4b: Filter blocked ATS platforms ---
+    console.print(f"\n[bold blue]Step 4b: Filtering blocked ATS platforms ({', '.join(sorted(BLOCKED_ATS))})...[/bold blue]")
+    submittable = []
+    blocked_count = 0
+    for job, score in qualifying:
+        ats = detect_ats_platform(job.careers_url)
+        if ats in BLOCKED_ATS:
+            blocked_count += 1
+            logger.info(f"  Blocked ({ats}): {job.company_name} — {job.careers_url[:80]}")
+            app = Application(
+                job_id=job.id,
+                status=ApplicationStatus.SKIPPED,
+                match_score=score.overall_score,
+                error_message=f"Blocked ATS: {ats}",
+            )
+            await db.insert_application(app)
+        else:
+            submittable.append((job, score))
+
+    console.print(
+        f"  {len(submittable)} submittable, {blocked_count} blocked "
+        f"({', '.join(sorted(BLOCKED_ATS))})"
+    )
+    qualifying = submittable
+
+    if not qualifying:
+        console.print("[yellow]All qualifying jobs are on blocked ATS platforms.[/yellow]")
         return
 
     # --- Step 5: Tailor (Writer → Editor → Mediator pipeline) ---
@@ -314,7 +349,33 @@ async def _apply_sequential(
 async def _apply_single(
     job, score, resume_path, cover_letter_text, candidate, settings, db: Database, audit: AuditTrail
 ) -> dict:
-    """Apply to a single job, record the result, and log to audit."""
+    """Apply to a single job, record the result, and log to audit.
+
+    Checks ATS platform before launching a browser session to avoid
+    wasting time/credits on Greenhouse/Lever (blocked by captcha).
+    """
+    # Quick-skip blocked ATS without spending a browser session
+    ats_platform = detect_ats_platform(job.careers_url)
+    if ats_platform and ats_platform in BLOCKED_ATS:
+        logger.info(
+            f"[{job.company_name}] Skipped (blocked ATS: {ats_platform}) — {job.careers_url[:80]}"
+        )
+        app = Application(
+            job_id=job.id,
+            status=ApplicationStatus.SKIPPED,
+            match_score=score.overall_score,
+            error_message=f"Blocked ATS: {ats_platform}",
+        )
+        await db.insert_application(app)
+        return {
+            "success": False,
+            "company": job.company_name,
+            "job_title": job.job_title,
+            "match_score": score.overall_score,
+            "message": f"Blocked ATS: {ats_platform}",
+            "ats_platform": ats_platform,
+        }
+
     app = Application(
         job_id=job.id,
         status=ApplicationStatus.PENDING,
