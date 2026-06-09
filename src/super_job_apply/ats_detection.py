@@ -56,7 +56,11 @@ _GH_QUERY_MARKERS = re.compile(r"[?&]gh_jid=", re.IGNORECASE)
 # Blocked platforms — these use reCAPTCHA/hCaptcha that defeats automation
 # ---------------------------------------------------------------------------
 
-BLOCKED_ATS: set[str] = {"greenhouse", "lever"}
+BLOCKED_ATS: set[str] = {"greenhouse"}
+
+# Platforms whose button-click submit is blocked by client-side JS validators,
+# but where direct form.submit() via JS bypasses the block (see applicator/submit_handlers.py).
+JS_SUBMIT_ATS: set[str] = {"lever"}
 
 # Domains with no application forms (listing-only aggregators, Cloudflare-blocked)
 USELESS_DOMAINS: set[str] = {
@@ -161,13 +165,15 @@ ATS_FORM_HINTS: dict[str, dict] = {
         ],
     },
     "lever": {
-        "description": "Custom forms with hCaptcha. BLOCKED.",
+        "description": "Custom forms — button clicks blocked, direct form.submit() works.",
         "form_type": "custom_components",
         "needs_special_handling": True,
-        "blocked": True,
+        "blocked": False,
+        "uses_js_submit": True,
         "tips": [
-            "hCaptcha on submission form",
-            "Relatively simple form layout but captcha is the blocker",
+            "Button click submit blocked by client-side JS validators",
+            "Direct document.querySelector('form').submit() bypasses the block",
+            "hCaptcha may appear but form.submit() submits before challenge fires",
         ],
     },
     "direct": {

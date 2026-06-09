@@ -475,10 +475,12 @@ def review(config_path: str) -> None:
 
 @main.command()
 @click.option("--config", "config_path", default="config.yaml", help="Path to config YAML")
-def submit(config_path: str) -> None:
+@click.option("--limit", type=int, default=None, help="Max applications to submit this run (for small-batch testing)")
+def submit(config_path: str, limit: int | None) -> None:
     """Submit all approved applications (fills forms and clicks submit).
 
     Uses concurrent browser sessions based on max_concurrent_browsers setting.
+    Use --limit to run a small batch.
     """
     try:
         config = load_config(config_path)
@@ -656,6 +658,10 @@ def submit(config_path: str) -> None:
                 console.print("[yellow]All approved applications are on blocked ATS platforms.[/yellow]")
                 console.print("Run 'super-job-apply submittable' to see available platforms.")
                 return
+
+            if limit is not None and limit > 0 and limit < len(apps):
+                console.print(f"[dim]--limit {limit}: trimming from {len(apps)} to {limit} apps[/dim]")
+                apps = apps[:limit]
 
             max_browsers = settings.max_concurrent_browsers
             mode = f"concurrent, {max_browsers} browsers" if settings.concurrent else "sequential"
@@ -943,6 +949,130 @@ def resolve_urls(config_path: str) -> None:
                 )
 
         asyncio.run(_resolve())
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+@main.command(name="form-cache")
+@click.option("--clear", is_flag=True, help="Clear the form cache file")
+def form_cache_cmd(clear: bool) -> None:
+    """Show form-cache statistics (observe() replay cache for ATS forms)."""
+    from pathlib import Path
+
+    from .applicator.form_cache import FormCache, _DEFAULT_PATH
+
+    if clear:
+        p = Path(_DEFAULT_PATH)
+        if p.exists():
+            p.unlink()
+            console.print(f"[green]Cleared form cache at {p}[/green]")
+        else:
+            console.print(f"[dim]No cache file at {p}[/dim]")
+        return
+
+    cache = FormCache()
+    stats_data = cache.stats()
+    console.print(f"\n[bold]Form cache at {cache.path}[/bold]")
+    console.print(f"  Entries: {stats_data['entries']}")
+    console.print(f"  Total hits (observe skipped): {stats_data['total_hits']}")
+    console.print(f"  Total updates (observe ran and cached): {stats_data['total_updates']}")
+    if stats_data["by_ats"]:
+        console.print("\n[bold]Entries by ATS:[/bold]")
+        for ats, n in sorted(stats_data["by_ats"].items(), key=lambda x: x[1], reverse=True):
+            console.print(f"  {ats:16s} {n}")
+
+
+@main.command(name="analyze-failures")
+@click.option("--config", "config_path", default="config.yaml", help="Path to config YAML")
+@click.option("--limit", default=200, help="Max failed applications to analyze")
+def analyze_failures(config_path: str, limit: int) -> None:
+    """Categorize failed applications by root cause and per-hostname breakdown.
+
+    Reports counts per failure category (captcha, 404, no-form, validation,
+    privacy, ats-blocked, other) and hostname, so you can prioritize fixes.
+    """
+    import re
+    from collections import defaultdict
+    from urllib.parse import urlparse
+
+    try:
+        config = load_config(config_path)
+        db = Database(config.application.db_path)
+
+        # Compile once. Order matters — most specific first.
+        categories: list[tuple[str, re.Pattern]] = [
+            ("captcha",     re.compile(r"captcha|recaptcha|hcaptcha|challenge", re.I)),
+            ("404",         re.compile(r"\b404\b|not\s*found|expired|closed|no\s*longer", re.I)),
+            ("ats-blocked", re.compile(r"blocked\s*ats|greenhouse|lever", re.I)),
+            ("no-form",     re.compile(r"no\s*form|listing|still\s*has", re.I)),
+            ("validation",  re.compile(r"validation|required\s*field|empty\s*required|must\s*be", re.I)),
+            ("privacy",     re.compile(r"privacy|consent|cookie|agreement", re.I)),
+            ("auth",        re.compile(r"login|sign\s*in|unauthorized|forbidden", re.I)),
+            ("timeout",     re.compile(r"timeout|timed?\s*out|took\s*too\s*long", re.I)),
+            ("network",     re.compile(r"network|connection|dns|unreachable", re.I)),
+        ]
+
+        def categorize(msg: str) -> str:
+            if not msg:
+                return "unknown"
+            for name, pat in categories:
+                if pat.search(msg):
+                    return name
+            return "other"
+
+        async def _analyze():
+            apps = await db.get_applications(
+                status=ApplicationStatus("failed"), limit=limit
+            )
+            if not apps:
+                console.print("[yellow]No failed applications to analyze.[/yellow]")
+                return
+
+            by_cat: dict[str, int] = defaultdict(int)
+            by_host: dict[str, int] = defaultdict(int)
+            by_cat_host: dict[tuple[str, str], int] = defaultdict(int)
+            examples: dict[str, list[str]] = defaultdict(list)
+
+            for app in apps:
+                msg = app.get("error_message") or ""
+                cat = categorize(msg)
+                host = (urlparse(app.get("careers_url") or "").hostname or "unknown").replace("www.", "")
+                by_cat[cat] += 1
+                by_host[host] += 1
+                by_cat_host[(cat, host)] += 1
+                if len(examples[cat]) < 3:
+                    examples[cat].append(
+                        f"{app.get('company_name', '?')} — {msg[:80]}"
+                    )
+
+            total = len(apps)
+            console.print(f"\n[bold]Analyzed {total} failed applications[/bold]\n")
+
+            console.print("[bold]By category:[/bold]")
+            for cat in sorted(by_cat, key=by_cat.get, reverse=True):
+                pct = 100.0 * by_cat[cat] / total
+                console.print(f"  {cat:12s} {by_cat[cat]:4d}  ({pct:5.1f}%)")
+                for ex in examples[cat]:
+                    console.print(f"    [dim]· {ex}[/dim]")
+
+            console.print("\n[bold]Top 10 hostnames:[/bold]")
+            for host in sorted(by_host, key=by_host.get, reverse=True)[:10]:
+                console.print(f"  {host:40s} {by_host[host]:4d}")
+
+            # Identify hotspots: hostnames that dominate a category
+            console.print("\n[bold]Category × hostname hotspots (n≥3):[/bold]")
+            hotspots = sorted(
+                ((k, v) for k, v in by_cat_host.items() if v >= 3),
+                key=lambda kv: kv[1], reverse=True,
+            )
+            if hotspots:
+                for (cat, host), n in hotspots[:15]:
+                    console.print(f"  {cat:12s} × {host:40s} {n:4d}")
+            else:
+                console.print("  [dim](none)[/dim]")
+
+        asyncio.run(_analyze())
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)

@@ -22,6 +22,7 @@ from stagehand import AsyncStagehand
 from ..ats_detection import (
     ATS_FORM_HINTS,
     BLOCKED_ATS,
+    JS_SUBMIT_ATS,
     detect_ats_platform,
     get_form_hints,
     is_blocked_ats,
@@ -33,8 +34,33 @@ from ..models import (
     JOB_DESCRIPTION_SCHEMA,
     JobPosting,
 )
+from .ats_fillers import fast_fill_common_fields
 from .email_verifier import EmailWatcher
+from .form_cache import FormCache
+from .submit_handlers import (
+    find_apply_link,
+    find_form_frame,
+    find_new_tab_url,
+    js_submit_form,
+)
 from .uploader import upload_resume
+
+_FORM_CACHE = FormCache()
+
+# Map fast-fill field names → keyword substrings in field_map/observe() descriptions.
+# When fast-fill succeeds for a field, these keys are removed from the act() loop
+# so we don't re-submit the same value via the LLM.
+_FASTFILL_TO_MAP_KEYS: dict[str, set[str]] = {
+    "first_name": {"first name"},
+    "last_name": {"last name"},
+    "full_name": {"first name", "last name"},  # if we filled full_name, both sub-fields are covered
+    "email": {"email"},
+    "phone": {"phone"},
+    "location": {"location", "address", "city"},
+    "linkedin": {"linkedin"},
+    "website": {"website", "portfolio"},
+    "github": {"github"},
+}
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +229,13 @@ async def apply_to_job(
     session_url = f"https://browserbase.com/sessions/{sid}"
     logger.info(f"{prefix} Session: {session_url}")
 
+    # When the application form lives inside an iframe (Greenhouse/Workable
+    # embeds), all Stagehand calls must target that frame's ID.
+    frame_target: dict = {"id": None}
+
+    def _frame_kwargs() -> dict:
+        return {"frame_id": frame_target["id"]} if frame_target["id"] else {}
+
     async def act(instruction: str) -> str:
         """Single atomic browser action with logging."""
         try:
@@ -210,6 +243,7 @@ async def apply_to_job(
                 id=sid, input=instruction,
                 options={"model": {"model_name": model}, "timeout": 30000},
                 timeout=60.0,
+                **_frame_kwargs(),
             )
             msg = resp.data.result.message if resp.data and resp.data.result else "No result"
             success = resp.data.result.success if resp.data and resp.data.result else False
@@ -237,6 +271,7 @@ async def apply_to_job(
                     },
                 },
                 timeout=30.0,
+                **_frame_kwargs(),
             )
             return resp.data.result or {}
         except Exception as e:
@@ -266,14 +301,47 @@ async def apply_to_job(
                 await act("Click 'Accept', 'I Agree', 'I Accept', 'Continue', or 'OK' to accept the privacy agreement or cookies")
                 await asyncio.sleep(2)
 
-            await act("Click the 'Apply', 'Apply Now', 'Apply for this job', or 'Start Application' button")
-            await asyncio.sleep(4)
+            # Deterministic first: if Apply is a plain <a href>, navigate
+            # straight to it — LLM clicks can land on styled overlays and
+            # silently do nothing (e.g. UHG's Taleo anchor).
+            cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+            try:
+                apply_href = await find_apply_link(cdp_url, job.careers_url, prefix)
+            except Exception as e:
+                logger.warning(f"{prefix}   apply-link check failed: {e}")
+                apply_href = None
+            if apply_href:
+                logger.info(f"{prefix}   Navigating to apply link: {apply_href[:60]}")
+                await client.sessions.navigate(id=sid, url=apply_href)
+                await asyncio.sleep(4)
+            else:
+                await act("Click the 'Apply', 'Apply Now', 'Apply for this job', or 'Start Application' button")
+                await asyncio.sleep(4)
 
             # Re-assess
             page = await extract("Is this now an application form with input fields? Or a login page? Or still a listing?")
             page_type = page.get("page_type", "other")
             has_form = page.get("has_form_fields", False)
             logger.info(f"{prefix}   After click: {page_type} | Form: {has_form}")
+
+            if not has_form and page_type not in ("login_page",):
+                # The Apply click may have opened the form in a new tab
+                # (target=_blank) — Stagehand stays on the original tab and
+                # never sees it. Follow the new tab's URL in the main tab.
+                cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+                try:
+                    new_tab_url = await find_new_tab_url(cdp_url, job.careers_url, prefix)
+                except Exception as e:
+                    logger.warning(f"{prefix}   new-tab check failed: {e}")
+                    new_tab_url = None
+                if new_tab_url:
+                    logger.info(f"{prefix}   Following new tab: {new_tab_url[:60]}")
+                    await client.sessions.navigate(id=sid, url=new_tab_url)
+                    await asyncio.sleep(3)
+                    page = await extract("Is this an application form with input fields? Or a login page?")
+                    page_type = page.get("page_type", "other")
+                    has_form = page.get("has_form_fields", False)
+                    logger.info(f"{prefix}   After tab-follow: {page_type} | Form: {has_form}")
 
             if not has_form and page_type not in ("login_page",):
                 # Try scrolling down — some sites hide the form below the fold
@@ -305,26 +373,109 @@ async def apply_to_job(
             has_form = page.get("has_form_fields", False)
 
         if not has_form:
+            # The form may live inside an iframe (Greenhouse/Workable embed)
+            # that main-frame extract() cannot see.
+            cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+            try:
+                form_frame = await find_form_frame(cdp_url, prefix)
+            except Exception as e:
+                logger.warning(f"{prefix}   iframe check failed: {e}")
+                form_frame = None
+            if form_frame:
+                frame_target["id"] = form_frame["frame_id"]
+                has_form = True
+                logger.info(
+                    f"{prefix}   Targeting form iframe ({form_frame['input_count']} inputs)"
+                )
+
+        if not has_form:
             desc = page.get("page_description", "")[:100]
             logger.warning(f"{prefix} NO FORM FOUND: {page_type} — {desc}")
             return {"success": False, "message": f"No form: {page_type}. {desc}", "session_url": session_url, "account_created": False}
 
-        # === STEP 5: Observe ALL form fields ===
-        logger.info(f"{prefix} STEP 5: Discovering all form fields with observe()...")
+        # === STEP 4.5: Fast-fill common fields via Playwright CSS selectors ===
+        # Skips LLM for ~5-9 common fields (name, email, phone, LinkedIn, location, etc.)
+        skip_keys: set[str] = set()
+        fastfill_count = 0
         try:
-            obs_resp = await client.sessions.observe(
-                id=sid,
-                instruction="Find ALL input fields, text areas, dropdowns, checkboxes, radio buttons, and file upload fields in the application form",
-            )
-            observed = obs_resp.data if isinstance(obs_resp.data, list) else (obs_resp.data.result if hasattr(obs_resp.data, 'result') else [])
-            field_names = []
-            for f in (observed or []):
-                desc = f.description if hasattr(f, 'description') else (f.get('description', '') if isinstance(f, dict) else str(f))
-                field_names.append(desc)
-            logger.info(f"{prefix}   Found {len(field_names)} form fields")
+            cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+            ff_result = await fast_fill_common_fields(cdp_url, candidate, prefix)
+            fastfill_count = ff_result.count
+            for field in ff_result.filled:
+                skip_keys.update(_FASTFILL_TO_MAP_KEYS.get(field, set()))
         except Exception as e:
-            logger.warning(f"{prefix}   observe() failed: {e} — falling back to manual fill")
-            field_names = []
+            logger.warning(f"{prefix}   fast-fill skipped: {e}")
+
+        # === STEP 5: Observe ALL form fields (scoped to <form> when possible) ===
+        logger.info(f"{prefix} STEP 5: Discovering all form fields with observe()...")
+        field_names: list[str] = []
+
+        def _desc_of(f) -> str:
+            return f.description if hasattr(f, "description") else (
+                f.get("description", "") if isinstance(f, dict) else str(f)
+            )
+
+        async def _call_observe(selector: str | None) -> list:
+            kwargs = {
+                "id": sid,
+                "instruction": (
+                    "Find ALL input fields, text areas, dropdowns, checkboxes, "
+                    "radio buttons, and file upload fields in the application form"
+                ),
+            }
+            if selector:
+                # Python Stagehand SDK puts selector under options, not top-level
+                kwargs["options"] = {"selector": selector}
+            kwargs.update(_frame_kwargs())
+            resp = await client.sessions.observe(**kwargs)
+            data = resp.data if isinstance(resp.data, list) else (
+                resp.data.result if hasattr(resp.data, "result") else []
+            )
+            return data or []
+
+        # Check cache first — skip observe() entirely on hit.
+        cached = _FORM_CACHE.lookup(ats_platform, job.careers_url)
+        if cached:
+            field_names = [c.get("description", "") for c in cached if c.get("description")]
+            logger.info(f"{prefix}   cache HIT: {len(field_names)} cached fields (ats={ats_platform})")
+            _FORM_CACHE.record_hit(ats_platform, job.careers_url)
+        else:
+            # Scoping to //form cuts LLM tokens ~2-3x and filters navigation/footer inputs.
+            # Fall back to unscoped if the page has no <form> element or observe returns empty.
+            try:
+                observed = await _call_observe(selector="//form")
+                scope = "form-scoped"
+                if not observed:
+                    logger.info(f"{prefix}   //form empty — retrying unscoped")
+                    observed = await _call_observe(selector=None)
+                    scope = "unscoped"
+                if not observed and not frame_target["id"]:
+                    # Nothing on the main frame — the form may be iframe-embedded
+                    cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+                    try:
+                        form_frame = await find_form_frame(cdp_url, prefix)
+                    except Exception as e:
+                        logger.warning(f"{prefix}   iframe check failed: {e}")
+                        form_frame = None
+                    if form_frame:
+                        frame_target["id"] = form_frame["frame_id"]
+                        observed = await _call_observe(selector=None)
+                        scope = f"iframe ({form_frame['input_count']} inputs)"
+                field_names = [_desc_of(f) for f in observed]
+                logger.info(f"{prefix}   Found {len(field_names)} form fields ({scope})")
+                # Persist for next time — store as normalized dicts.
+                # 1-2 field observations are usually a privacy/login page,
+                # not the real form; caching them poisons every later job
+                # on the same hostname.
+                if len(field_names) >= 3:
+                    _FORM_CACHE.save(
+                        ats_platform,
+                        job.careers_url,
+                        [{"description": d} for d in field_names],
+                    )
+            except Exception as e:
+                logger.warning(f"{prefix}   observe() failed: {e} — falling back to manual fill")
+                field_names = []
 
         # === STEP 6: Fill every field using smart mapping ===
         logger.info(f"{prefix} STEP 6: Filling all fields...")
@@ -400,13 +551,17 @@ async def apply_to_job(
             "publication": "",
         }
 
-        fields_filled = 0
+        fields_filled = fastfill_count  # Count fast-filled fields too
 
         for desc in field_names:
             dl = desc.lower()
 
             # Skip file uploads
             if any(kw in dl for kw in ["file upload", "resume", "attach", "cv upload"]):
+                continue
+
+            # Skip fields already handled by fast-fill
+            if any(skip_kw in dl for skip_kw in skip_keys):
                 continue
 
             # Try text area mapping FIRST (long-form fields like "describe the most complex...")
@@ -494,9 +649,25 @@ async def apply_to_job(
         confirmation = ""
         submission_confidence = "not_submitted"
         if submit:
-            logger.info(f"{prefix} STEP 10: Clicking submit")
-            await act("Click the Submit, Submit Application, Apply, or Send Application button")
-            await asyncio.sleep(6)  # Give Greenhouse time to process + redirect
+            if ats_platform in JS_SUBMIT_ATS:
+                logger.info(f"{prefix} STEP 10: JS form.submit() for {ats_platform}")
+                cdp_url = f"wss://connect.browserbase.com?apiKey={os.environ.get('BROWSERBASE_API_KEY')}&sessionId={sid}"
+                js_result = await js_submit_form(cdp_url, prefix)
+                if js_result.get("submitted") and js_result.get("confirmation_text"):
+                    confirmation = js_result["confirmation_text"]
+                    submission_confidence = "confirmed"
+                    logger.info(f"{prefix} CONFIRMED via JS submit: {confirmation[:80]}")
+                elif js_result.get("submitted"):
+                    # Submitted but no confirmation keyword — fall through to extract()
+                    logger.info(f"{prefix}   JS submit fired, verifying with extract...")
+                else:
+                    logger.warning(f"{prefix}   JS submit failed — falling back to act()")
+                    await act("Click the Submit, Submit Application, Apply, or Send Application button")
+                await asyncio.sleep(3)
+            else:
+                logger.info(f"{prefix} STEP 10: Clicking submit")
+                await act("Click the Submit, Submit Application, Apply, or Send Application button")
+                await asyncio.sleep(6)  # Give Greenhouse time to process + redirect
 
             # === STEP 11: Handle security code page ===
             post = await extract(
@@ -604,7 +775,9 @@ async def apply_to_job(
                 logger.info(f"{prefix} UNCERTAIN: {verification['reason'][:80]}")
 
         # Determine result
-        success = has_form  # We found a form and filled it
+        # A filled form only counts as success if verification did not
+        # conclude the submission failed (captcha, validation errors).
+        success = has_form and submission_confidence != "failed"
         confirmed = bool(confirmation)
         message = (
             f"Fields filled: {fields_filled}. "

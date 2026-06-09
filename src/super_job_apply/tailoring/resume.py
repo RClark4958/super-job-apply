@@ -91,11 +91,12 @@ def _extract_docx_content(path: str) -> str:
 
 def _build_output_path(job: JobPosting, output_dir: str, doc_type: str) -> str:
     """Build a safe output file path."""
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    apps_dir = Path(output_dir) / "applications"
+    apps_dir.mkdir(parents=True, exist_ok=True)
     safe_company = "".join(c if c.isalnum() or c in " -_" else "" for c in job.company_name)
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in job.job_title)
     filename = f"{safe_company}_{safe_title}_{doc_type}.docx".replace(" ", "_")
-    return str(Path(output_dir) / filename)
+    return str(apps_dir / filename)
 
 
 def _write_tailored_docx(content: str, template_path: str, output_path: str) -> None:

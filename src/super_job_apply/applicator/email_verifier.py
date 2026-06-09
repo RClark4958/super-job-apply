@@ -82,11 +82,14 @@ class EmailWatcher:
         if not self.available:
             return None
 
-        # Check if we already have a code for this company
+        # Check if we already have a code for this company.
+        # Codes are single-use: sites rotate them per attempt, so serving a
+        # cached one to a retry guarantees a validation failure. Pop on read.
         hint_lower = company_hint.lower()
-        for key, code in self._codes.items():
+        for key, code in list(self._codes.items()):
             if hint_lower in key.lower() or key.lower() in hint_lower:
                 logger.info(f"Email watcher: found cached code '{code}' for {company_hint}")
+                del self._codes[key]
                 return code
 
         # Wait for new code
@@ -95,8 +98,9 @@ class EmailWatcher:
         try:
             await asyncio.wait_for(self._code_event.wait(), timeout=timeout)
             # Check again after event
-            for key, code in self._codes.items():
+            for key, code in list(self._codes.items()):
                 if hint_lower in key.lower() or key.lower() in hint_lower:
+                    del self._codes[key]
                     return code
             return self._latest_code
         except asyncio.TimeoutError:

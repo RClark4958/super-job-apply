@@ -65,11 +65,12 @@ async def generate_cover_letter(
 
 def _build_output_path(job: JobPosting, output_dir: str) -> str:
     """Build a safe output file path for the cover letter."""
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    apps_dir = Path(output_dir) / "applications"
+    apps_dir.mkdir(parents=True, exist_ok=True)
     safe_company = "".join(c if c.isalnum() or c in " -_" else "" for c in job.company_name)
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in job.job_title)
     filename = f"{safe_company}_{safe_title}_cover_letter.docx".replace(" ", "_")
-    return str(Path(output_dir) / filename)
+    return str(apps_dir / filename)
 
 
 def _write_cover_letter_docx(text: str, output_path: str) -> None:

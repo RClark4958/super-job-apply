@@ -65,7 +65,7 @@ class ApplicationSettings(BaseModel):
     model: str = "google/gemini-2.5-pro"
     agent_model: str = "google/gemini-2.5-flash"
     tailoring_model: str = "claude-sonnet-4-6"
-    db_path: str = "./applications.db"
+    db_path: str = "./data/applications.db"
     account_password: str = ""
 
 
